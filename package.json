@@ -2,6 +2,9 @@
   "name": "rsshub-wa",
   "private": true,
   "version": "0.0.1",
+  "dependencies": {
+    "cheerio": "^1.0.0-rc.12"
+  },
   "devDependencies": {
     "wrangler": "^3.0.0",
     "typescript": "^5.0.0"
