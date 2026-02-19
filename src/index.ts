@@ -7,6 +7,8 @@ type FeedItem = {
   pubDate?: string;
   description?: string;
   guid: string;
+  hash: string; // stable ID for Make dedupe
+  source: string;
 };
 
 function escapeXml(str: string) {
@@ -18,12 +20,22 @@ function escapeXml(str: string) {
     .replaceAll("'", "&apos;");
 }
 
+function stableHash(input: string) {
+  // Simple deterministic hash (djb2 variant). Good enough for stable IDs/dedupe.
+  let hash = 5381;
+  for (let i = 0; i < input.length; i++) {
+    hash = (hash * 33) ^ input.charCodeAt(i);
+  }
+  return (hash >>> 0).toString(16);
+}
+
 function toRss(title: string, link: string, items: FeedItem[]) {
   const now = new Date().toUTCString();
   const itemXml = items
     .map((i) => {
       const desc = i.description ? `<description>${escapeXml(i.description)}</description>` : "";
       const pub = i.pubDate ? `<pubDate>${escapeXml(i.pubDate)}</pubDate>` : "";
+      // GUID should stay stable forever (we use link-based guid)
       return `
       <item>
         <title>${escapeXml(i.title)}</title>
@@ -53,7 +65,7 @@ async function fetchChildSafetyNews(): Promise<FeedItem[]> {
     headers: {
       // Basic, polite UA
       "user-agent": "childsafetyawarenesswa-rss-poc/1.0",
-      "accept": "text/html,application/xhtml+xml",
+      accept: "text/html,application/xhtml+xml",
     },
   });
 
@@ -64,11 +76,7 @@ async function fetchChildSafetyNews(): Promise<FeedItem[]> {
   const html = await res.text();
   const $ = load(html);
 
-  // The page is a list of news items with a title link to /news/<slug>,
-  // plus date text and snippet. We'll collect all /news/<slug> links inside main content.
   const items: FeedItem[] = [];
-
-  // Collect candidate links
   const links = $("main a[href^='/news/']").toArray();
 
   for (const a of links) {
@@ -82,13 +90,13 @@ async function fetchChildSafetyNews(): Promise<FeedItem[]> {
     const link = new URL(href, "https://www.childsafety.gov.au").toString();
 
     // Find surrounding text for date + snippet.
-    // We'll use a simple proximity approach: look at parent and next siblings.
     const parent = el.parent();
     const dateText = parent.next().text().trim();
     const snippetText = parent.nextAll().eq(1).text().trim();
 
-    // Create stable guid
+    // Stable GUID and hash for dedupe
     const guid = `childsafety:${link}`;
+    const hash = stableHash(guid);
 
     items.push({
       title,
@@ -96,6 +104,8 @@ async function fetchChildSafetyNews(): Promise<FeedItem[]> {
       pubDate: dateText || undefined,
       description: snippetText || undefined,
       guid,
+      hash,
+      source: "childsafety.gov.au",
     });
   }
 
@@ -115,15 +125,40 @@ export default {
       return new Response("Worker is live", { headers: { "content-type": "text/plain" } });
     }
 
-    // POC feed endpoint
+    // JSON endpoint (Make-friendly)
+    if (url.pathname === "/feeds/childsafety/news.json") {
+      try {
+        const items = await fetchChildSafetyNews();
+        const json = items.map((i) => ({
+          title: i.title,
+          link: i.link,
+          published: i.pubDate ?? null,
+          summary: i.description ?? null,
+          guid: i.guid,
+          hash: i.hash,
+          source: i.source,
+        }));
+
+        return new Response(JSON.stringify(json, null, 2), {
+          headers: {
+            "content-type": "application/json; charset=utf-8",
+            "cache-control": "public, max-age=1800",
+          },
+        });
+      } catch (err: any) {
+        return new Response(JSON.stringify({ error: err?.message || String(err) }, null, 2), {
+          status: 500,
+          headers: { "content-type": "application/json; charset=utf-8" },
+        });
+      }
+    }
+
+    // RSS endpoint
     if (url.pathname === "/feeds/childsafety/news") {
       try {
         const items = await fetchChildSafetyNews();
-        const rss = toRss(
-          "ChildSafety.gov.au - News (Latest)",
-          "https://www.childsafety.gov.au/news",
-          items
-        );
+        const rss = toRss("ChildSafety.gov.au - News (Latest)", "https://www.childsafety.gov.au/news", items);
+
         return new Response(rss, {
           headers: {
             "content-type": "application/rss+xml; charset=utf-8",
