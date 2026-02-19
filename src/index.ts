@@ -11,12 +11,33 @@ type FeedItem = {
   source: string;
 };
 
+type FeedMeta = {
+  source: string;
+  listUrl: string;
+  lastSuccessIso?: string; // when we last successfully refreshed from upstream
+  lastAttemptIso?: string; // when we last attempted refresh
+  lastError?: string; // last upstream error (if any)
+  itemCount?: number;
+};
+
+export interface Env {
+  // Bind a KV namespace named FEED_KV in your worker settings (wrangler / dashboard)
+  FEED_KV: KVNamespace;
+}
+
 const SOURCE = "childsafety.gov.au";
 const LIST_URL = "https://www.childsafety.gov.au/news";
 
-// Cache settings
-const CACHE_TTL_SECONDS = 6 * 60 * 60; // keep in CF edge cache up to 6h
-const CLIENT_MAX_AGE_SECONDS = 30 * 60; // tell clients 30m
+// KV keys
+const KV_ITEMS_KEY = "feeds:childsafety:news:items:v1";
+const KV_RSS_KEY = "feeds:childsafety:news:rss:v1";
+const KV_META_KEY = "feeds:childsafety:news:meta:v1";
+
+// Refresh strategy
+const REFRESH_INTERVAL_SECONDS = 30 * 60; // how "fresh" we want KV content (30m)
+const KV_TTL_SECONDS = 7 * 24 * 60 * 60; // keep KV values for 7 days (safety net)
+const CLIENT_MAX_AGE_SECONDS = 10 * 60; // tell clients they can cache 10m
+const EDGE_STALE_WHILE_REFRESH_SECONDS = 5 * 60; // serve stale while background refresh runs
 
 function escapeXml(str: string) {
   return str
@@ -68,56 +89,40 @@ function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-/**
- * Upstream fetch with:
- * - browser-like headers
- * - retries/backoff
- * - Cloudflare edge caching of the upstream HTML (critical to reduce 520s from Make/other regions)
- */
 async function fetchWithRetry(url: string, tries = 3): Promise<Response> {
   let lastErr: any;
-
-  const headers: Record<string, string> = {
-    // More browser-like headers can help with origin/CDN quirks (and some WAF rules)
-    "user-agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-    accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "accept-language": "en-AU,en;q=0.9",
-    // Avoid weird intermediary caches serving partials
-    "cache-control": "no-cache",
-    pragma: "no-cache",
-    // Some sites behave better with a referer
-    referer: "https://www.childsafety.gov.au/",
-  };
 
   for (let attempt = 1; attempt <= tries; attempt++) {
     try {
       const res = await fetch(url, {
-        headers,
-        redirect: "follow",
-        // Cloudflare fetch options: cache the upstream HTML at the edge
-        cf: {
-          cacheEverything: true,
-          cacheTtl: CACHE_TTL_SECONDS,
+        headers: {
+          "user-agent":
+            "Mozilla/5.0 (compatible; childsafetyawarenesswa-rss/1.0; +https://rsshub-wa.childsafetyawarenesswa.workers.dev)",
+          accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "accept-language": "en-AU,en;q=0.9",
+          "cache-control": "no-cache",
+          pragma: "no-cache",
         },
-      } as any);
+        // Small edge caching to reduce origin hits (doesn't help if origin blocks)
+        cf: { cacheTtl: 300, cacheEverything: false },
+      });
 
       if (res.ok) return res;
 
-      // Retry on 5xx, including 520-ish conditions
+      // Retry on 5xx
       if (res.status >= 500 && res.status <= 599) {
         lastErr = new Error(`Upstream fetch failed: ${res.status} ${res.statusText}`);
       } else {
-        // non-retryable
+        // 4xx usually means blocked or not found; don't hammer
         throw new Error(`Upstream fetch failed: ${res.status} ${res.statusText}`);
       }
     } catch (e: any) {
       lastErr = e;
     }
 
-    // Backoff: 400ms, 800ms, 1200ms ...
     if (attempt < tries) {
-      await sleep(400 * attempt);
+      const backoff = 250 * attempt * attempt;
+      await sleep(backoff);
     }
   }
 
@@ -126,7 +131,6 @@ async function fetchWithRetry(url: string, tries = 3): Promise<Response> {
 
 async function fetchChildSafetyNews(): Promise<FeedItem[]> {
   const res = await fetchWithRetry(LIST_URL, 3);
-
   const html = await res.text();
   const $ = load(html);
 
@@ -143,7 +147,7 @@ async function fetchChildSafetyNews(): Promise<FeedItem[]> {
 
     const link = new URL(href, "https://www.childsafety.gov.au").toString();
 
-    // “best-effort” proximity extraction
+    // Best-effort proximity extraction
     const parent = el.parent();
     const dateText = parent.next().text().trim();
     const snippetText = parent.nextAll().eq(1).text().trim();
@@ -188,73 +192,239 @@ function rssResponse(rss: string, extraHeaders: Record<string, string> = {}) {
   });
 }
 
-/**
- * Serve cached response if present.
- * If upstream fails, fall back to cache (if any).
- */
-async function cachedOrFresh(request: Request, buildFresh: () => Promise<Response>): Promise<Response> {
-  const cache = caches.default;
-  const cacheKey = new Request(new URL(request.url).toString(), request);
+function textResponse(text: string, status = 200, extraHeaders: Record<string, string> = {}) {
+  return new Response(text, {
+    status,
+    headers: {
+      "content-type": "text/plain; charset=utf-8",
+      ...extraHeaders,
+    },
+  });
+}
 
-  const cached = await cache.match(cacheKey);
-  if (cached) {
-    const hit = new Response(cached.body, cached);
-    hit.headers.set("x-cache", "HIT");
-    return hit;
-  }
-
+async function getMeta(env: Env): Promise<FeedMeta> {
+  const raw = await env.FEED_KV.get(KV_META_KEY);
+  if (!raw) return { source: SOURCE, listUrl: LIST_URL };
   try {
-    const fresh = await buildFresh();
-
-    // Put into cache with a longer TTL at the edge
-    const toCache = new Response(fresh.body, fresh);
-    toCache.headers.set("cache-control", `public, max-age=${CACHE_TTL_SECONDS}`);
-    toCache.headers.set("x-cache", "MISS");
-
-    // Need a clone to return because body is a stream
-    const freshToReturn = new Response(toCache.body, toCache);
-    freshToReturn.headers.set("cache-control", `public, max-age=${CLIENT_MAX_AGE_SECONDS}`);
-    freshToReturn.headers.set("x-cache", "MISS");
-
-    await cache.put(cacheKey, toCache.clone());
-    return freshToReturn;
-  } catch (err: any) {
-    const fallback = await cache.match(cacheKey);
-    if (fallback) {
-      const stale = new Response(fallback.body, fallback);
-      stale.headers.set("x-cache", "STALE");
-      return stale;
-    }
-
-    return jsonResponse({ error: err?.message || String(err) }, { "x-cache": "ERROR" });
+    return JSON.parse(raw) as FeedMeta;
+  } catch {
+    return { source: SOURCE, listUrl: LIST_URL };
   }
 }
 
+function metaAgeSeconds(meta: FeedMeta): number | null {
+  if (!meta.lastSuccessIso) return null;
+  const t = Date.parse(meta.lastSuccessIso);
+  if (Number.isNaN(t)) return null;
+  return Math.floor((Date.now() - t) / 1000);
+}
+
+async function writeKv(env: Env, items: FeedItem[]) {
+  const rss = toRss("ChildSafety.gov.au - News (Latest)", LIST_URL, items);
+
+  const meta: FeedMeta = {
+    source: SOURCE,
+    listUrl: LIST_URL,
+    lastSuccessIso: new Date().toISOString(),
+    lastAttemptIso: new Date().toISOString(),
+    lastError: undefined,
+    itemCount: items.length,
+  };
+
+  await Promise.all([
+    env.FEED_KV.put(KV_ITEMS_KEY, JSON.stringify(items), { expirationTtl: KV_TTL_SECONDS }),
+    env.FEED_KV.put(KV_RSS_KEY, rss, { expirationTtl: KV_TTL_SECONDS }),
+    env.FEED_KV.put(KV_META_KEY, JSON.stringify(meta), { expirationTtl: KV_TTL_SECONDS }),
+  ]);
+}
+
+async function writeMetaError(env: Env, message: string) {
+  const prev = await getMeta(env);
+  const meta: FeedMeta = {
+    ...prev,
+    lastAttemptIso: new Date().toISOString(),
+    lastError: message,
+  };
+  await env.FEED_KV.put(KV_META_KEY, JSON.stringify(meta), { expirationTtl: KV_TTL_SECONDS });
+}
+
+/**
+ * Refresh from upstream and store into KV.
+ * Returns true on success, false on failure.
+ */
+async function refreshNow(env: Env): Promise<boolean> {
+  try {
+    const items = await fetchChildSafetyNews();
+    await writeKv(env, items);
+    return true;
+  } catch (e: any) {
+    await writeMetaError(env, e?.message || String(e));
+    return false;
+  }
+}
+
+/**
+ * Serve from KV. If missing -> try refresh once.
+ * If stale -> serve KV immediately and refresh in background.
+ */
+async function serveJson(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const meta = await getMeta(env);
+  const age = metaAgeSeconds(meta);
+
+  const kvItemsRaw = await env.FEED_KV.get(KV_ITEMS_KEY);
+
+  // If we have data:
+  if (kvItemsRaw) {
+    // If stale, refresh in background but serve now
+    if (age === null || age > REFRESH_INTERVAL_SECONDS) {
+      ctx.waitUntil(
+        (async () => {
+          // small jitter so multiple hits don’t stampede
+          await sleep(Math.floor(Math.random() * 750));
+          await refreshNow(env);
+        })()
+      );
+      return jsonResponse(JSON.parse(kvItemsRaw), {
+        "x-feed-source": SOURCE,
+        "x-feed-status": "STALE_SERVE_REFRESHING",
+        "x-feed-age-seconds": String(age ?? -1),
+        "cache-control": `public, max-age=${CLIENT_MAX_AGE_SECONDS}, stale-while-revalidate=${EDGE_STALE_WHILE_REFRESH_SECONDS}`,
+      });
+    }
+
+    return jsonResponse(JSON.parse(kvItemsRaw), {
+      "x-feed-source": SOURCE,
+      "x-feed-status": "FRESH_FROM_KV",
+      "x-feed-age-seconds": String(age ?? -1),
+      "cache-control": `public, max-age=${CLIENT_MAX_AGE_SECONDS}`,
+    });
+  }
+
+  // No KV data yet: try a synchronous refresh once
+  const ok = await refreshNow(env);
+  if (!ok) {
+    const metaAfter = await getMeta(env);
+    return jsonResponse(
+      {
+        error: metaAfter.lastError || "Upstream refresh failed",
+        hint: "KV empty and upstream blocked/failed. Try again later (cron will keep attempting).",
+        meta: metaAfter,
+      },
+      {
+        "x-feed-source": SOURCE,
+        "x-feed-status": "EMPTY_AND_REFRESH_FAILED",
+      }
+    );
+  }
+
+  const kvItemsRaw2 = await env.FEED_KV.get(KV_ITEMS_KEY);
+  if (!kvItemsRaw2) {
+    return jsonResponse(
+      { error: "Refresh succeeded but KV read failed (unexpected)" },
+      { "x-feed-status": "KV_READ_FAILED" }
+    );
+  }
+
+  return jsonResponse(JSON.parse(kvItemsRaw2), {
+    "x-feed-source": SOURCE,
+    "x-feed-status": "REFRESHED_ON_DEMAND",
+  });
+}
+
+async function serveRss(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const meta = await getMeta(env);
+  const age = metaAgeSeconds(meta);
+
+  const kvRss = await env.FEED_KV.get(KV_RSS_KEY);
+
+  if (kvRss) {
+    if (age === null || age > REFRESH_INTERVAL_SECONDS) {
+      ctx.waitUntil(
+        (async () => {
+          await sleep(Math.floor(Math.random() * 750));
+          await refreshNow(env);
+        })()
+      );
+      return rssResponse(kvRss, {
+        "x-feed-source": SOURCE,
+        "x-feed-status": "STALE_SERVE_REFRESHING",
+        "x-feed-age-seconds": String(age ?? -1),
+        "cache-control": `public, max-age=${CLIENT_MAX_AGE_SECONDS}, stale-while-revalidate=${EDGE_STALE_WHILE_REFRESH_SECONDS}`,
+      });
+    }
+
+    return rssResponse(kvRss, {
+      "x-feed-source": SOURCE,
+      "x-feed-status": "FRESH_FROM_KV",
+      "x-feed-age-seconds": String(age ?? -1),
+      "cache-control": `public, max-age=${CLIENT_MAX_AGE_SECONDS}`,
+    });
+  }
+
+  // No KV data: try refresh once
+  const ok = await refreshNow(env);
+  if (!ok) {
+    const metaAfter = await getMeta(env);
+    return textResponse(
+      `Error generating feed (KV empty): ${metaAfter.lastError || "Upstream refresh failed"}`,
+      503,
+      { "x-feed-status": "EMPTY_AND_REFRESH_FAILED" }
+    );
+  }
+
+  const kvRss2 = await env.FEED_KV.get(KV_RSS_KEY);
+  if (!kvRss2) {
+    return textResponse("Refresh succeeded but KV read failed (unexpected)", 500, {
+      "x-feed-status": "KV_READ_FAILED",
+    });
+  }
+
+  return rssResponse(kvRss2, {
+    "x-feed-source": SOURCE,
+    "x-feed-status": "REFRESHED_ON_DEMAND",
+  });
+}
+
 export default {
-  async fetch(request: Request): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
+    // Health
     if (url.pathname === "/") {
-      return new Response("Worker is live", { headers: { "content-type": "text/plain" } });
+      return textResponse("Worker is live");
+    }
+
+    // Quick debug/meta endpoint
+    if (url.pathname === "/feeds/childsafety/news.meta.json") {
+      const meta = await getMeta(env);
+      const age = metaAgeSeconds(meta);
+      return jsonResponse(
+        { ...meta, ageSeconds: age },
+        { "x-feed-source": SOURCE, "x-feed-status": "META" }
+      );
     }
 
     // JSON endpoint for Make
     if (url.pathname === "/feeds/childsafety/news.json") {
-      return cachedOrFresh(request, async () => {
-        const items = await fetchChildSafetyNews();
-        return jsonResponse(items);
-      });
+      return serveJson(request, env, ctx);
     }
 
     // RSS endpoint for readers
-    if (url.pathname === "/feeds/childsafety/news.rss" || url.pathname === "/feeds/childsafety/news.xml") {
-      return cachedOrFresh(request, async () => {
-        const items = await fetchChildSafetyNews();
-        const rss = toRss("ChildSafety.gov.au - News (Latest)", LIST_URL, items);
-        return rssResponse(rss);
-      });
+    if (
+      url.pathname === "/feeds/childsafety/news.rss" ||
+      url.pathname === "/feeds/childsafety/news.xml"
+    ) {
+      return serveRss(request, env, ctx);
     }
 
     return new Response("Not found", { status: 404 });
+  },
+
+  /**
+   * Cloudflare Cron Trigger.
+   * Configure this in your Worker (Triggers -> Cron) e.g. every 30 minutes.
+   */
+  async scheduled(_event: ScheduledEvent, env: Env, _ctx: ExecutionContext): Promise<void> {
+    await refreshNow(env);
   },
 };
