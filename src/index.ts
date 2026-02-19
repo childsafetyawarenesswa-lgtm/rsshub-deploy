@@ -96,8 +96,18 @@ async function fetchChildSafetyNews(): Promise<FeedItem[]> {
   }
 
   if (!res.ok) {
-    throw new Error(`Upstream fetch failed: ${res.status} ${res.statusText}`);
+    const ct = res.headers.get("content-type") || "";
+    const ray = res.headers.get("cf-ray") || "";
+    const server = res.headers.get("server") || "";
+    const bodySnippet = (await res.text()).slice(0, 800);
+
+    throw new Error(
+      `Upstream fetch failed: ${res.status} ${res.statusText}\n` +
+      `content-type=${ct}\nserver=${server}\ncf-ray=${ray}\n` +
+      `body-snippet:\n${bodySnippet}`
+    );
   }
+
 
   const contentType = res.headers.get("content-type") || "";
   if (!contentType.includes("text/html")) {
