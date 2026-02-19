@@ -15,7 +15,7 @@ const SOURCE = "childsafety.gov.au";
 const LIST_URL = "https://www.childsafety.gov.au/news";
 
 // Cache settings
-const CACHE_TTL_SECONDS = 6 * 60 * 60; // keep in CF cache up to 6h
+const CACHE_TTL_SECONDS = 6 * 60 * 60; // keep in CF edge cache up to 6h
 const CLIENT_MAX_AGE_SECONDS = 30 * 60; // tell clients 30m
 
 function escapeXml(str: string) {
@@ -68,24 +68,39 @@ function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/**
+ * Upstream fetch with:
+ * - browser-like headers
+ * - retries/backoff
+ * - Cloudflare edge caching of the upstream HTML (critical to reduce 520s from Make/other regions)
+ */
 async function fetchWithRetry(url: string, tries = 3): Promise<Response> {
   let lastErr: any;
+
+  const headers: Record<string, string> = {
+    // More browser-like headers can help with origin/CDN quirks (and some WAF rules)
+    "user-agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+    accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "accept-language": "en-AU,en;q=0.9",
+    // Avoid weird intermediary caches serving partials
+    "cache-control": "no-cache",
+    pragma: "no-cache",
+    // Some sites behave better with a referer
+    referer: "https://www.childsafety.gov.au/",
+  };
 
   for (let attempt = 1; attempt <= tries; attempt++) {
     try {
       const res = await fetch(url, {
-        headers: {
-          // More browser-like headers can help with origin/CDN quirks
-          "user-agent":
-            "Mozilla/5.0 (compatible; childsafetyawarenesswa-rss/1.0; +https://rsshub-wa.childsafetyawarenesswa.workers.dev)",
-          accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-          "accept-language": "en-AU,en;q=0.9",
-          "cache-control": "no-cache",
-          pragma: "no-cache",
+        headers,
+        redirect: "follow",
+        // Cloudflare fetch options: cache the upstream HTML at the edge
+        cf: {
+          cacheEverything: true,
+          cacheTtl: CACHE_TTL_SECONDS,
         },
-        // Cloudflare fetch options: cache upstream a little at the edge (helps reduce origin hits)
-        cf: { cacheTtl: 300, cacheEverything: false },
-      });
+      } as any);
 
       if (res.ok) return res;
 
@@ -100,10 +115,9 @@ async function fetchWithRetry(url: string, tries = 3): Promise<Response> {
       lastErr = e;
     }
 
-    // Backoff: 250ms, 750ms, 1500ms ...
+    // Backoff: 400ms, 800ms, 1200ms ...
     if (attempt < tries) {
-      const backoff = 250 * attempt * attempt;
-      await sleep(backoff);
+      await sleep(400 * attempt);
     }
   }
 
@@ -184,7 +198,6 @@ async function cachedOrFresh(request: Request, buildFresh: () => Promise<Respons
 
   const cached = await cache.match(cacheKey);
   if (cached) {
-    // mark as cache hit (helps debugging)
     const hit = new Response(cached.body, cached);
     hit.headers.set("x-cache", "HIT");
     return hit;
@@ -212,11 +225,8 @@ async function cachedOrFresh(request: Request, buildFresh: () => Promise<Respons
       stale.headers.set("x-cache", "STALE");
       return stale;
     }
-    // No cache to fall back to
-    return jsonResponse(
-      { error: err?.message || String(err) },
-      { "x-cache": "ERROR" }
-    );
+
+    return jsonResponse({ error: err?.message || String(err) }, { "x-cache": "ERROR" });
   }
 }
 
